@@ -2,12 +2,34 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const {RtcTokenBuilder, RtcRole, RtmTokenBuilder, RtmRole} = require('agora-access-token');
+const admin = require('firebase-admin');
 
 dotenv.config();
 const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 8080;
 const APP_ID = process.env.APP_ID;
 const APP_CERTIFICATE = process.env.APP_CERTIFICATE;
+
+// ===== Setup Firebase Admin (untuk kirim push notification & baca database) =====
+// FIREBASE_SERVICE_ACCOUNT harus diisi di environment variable Vercel, isinya
+// seluruh isi file JSON service account (Project Settings > Service Accounts >
+// Generate new private key di Firebase Console), di-copy sebagai satu baris string.
+// FIREBASE_DATABASE_URL isinya URL Realtime Database, contoh:
+// https://rndtalk-4ab15-default-rtdb.asia-southeast1.firebasedatabase.app
+let firebaseInitialized = false;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: process.env.FIREBASE_DATABASE_URL,
+  });
+  firebaseInitialized = true;
+  console.log('Firebase Admin berhasil diinisialisasi.');
+} catch (e) {
+  console.error('Firebase Admin GAGAL diinisialisasi:', e.message);
+}
 
 const nocache = (_, resp, next) => {
   resp.header('Cache-Control', 'private, no-cache, no-store, must-revalidate');
@@ -132,11 +154,75 @@ const generateRTEToken = (req, resp) => {
   return resp.json({ 'rtcToken': rtcToken, 'rtmToken': rtmToken });
 }
 
+// ===== Endpoint baru: kirim push notification (FCM) ke satu user =====
+// Body request (JSON):
+// {
+//   "targetUid": "uid tujuan di Firebase",
+//   "type": "message" atau "call",
+//   "title": "judul notifikasi",
+//   "body": "isi notifikasi",
+//   "data": { ...field tambahan bebas, misal roomId/channelName/fromName... }
+// }
+const sendNotification = async (req, resp) => {
+  resp.header('Access-Control-Allow-Origin', '*');
+
+  if (!firebaseInitialized) {
+    return resp.status(500).json({ 'error': 'Firebase Admin belum siap di server, cek environment variable.' });
+  }
+
+  const { targetUid, type, title, body, data } = req.body || {};
+
+  if (!targetUid) {
+    return resp.status(400).json({ 'error': 'targetUid is required' });
+  }
+  if (!type || (type !== 'message' && type !== 'call')) {
+    return resp.status(400).json({ 'error': 'type harus "message" atau "call"' });
+  }
+
+  try {
+    // Ambil fcmToken milik targetUid dari Realtime Database
+    const snapshot = await admin.database()
+      .ref(`users/${targetUid}/fcmToken`)
+      .get();
+
+    const fcmToken = snapshot.val();
+    if (!fcmToken) {
+      return resp.status(404).json({ 'error': 'targetUid tidak punya fcmToken (belum login/belum generate token)' });
+    }
+
+    // Kirim sebagai DATA MESSAGE (bukan notification message bawaan FCM),
+    // supaya Android yang mengontrol penuh tampilan notifikasi -- termasuk
+    // nanti untuk full-screen incoming call. Semua value di "data" HARUS
+    // berupa string (syarat FCM data message).
+    const messagePayload = {
+      token: fcmToken,
+      data: {
+        type: type,
+        title: title || '',
+        body: body || '',
+        ...(data ? Object.fromEntries(
+          Object.entries(data).map(([k, v]) => [k, String(v)])
+        ) : {}),
+      },
+      android: {
+        priority: 'high',
+      },
+    };
+
+    const response = await admin.messaging().send(messagePayload);
+    return resp.json({ 'success': true, 'messageId': response });
+  } catch (e) {
+    console.error('Gagal mengirim notifikasi:', e);
+    return resp.status(500).json({ 'error': e.message });
+  }
+}
+
 app.options('*', cors());
 app.get('/ping', nocache, ping)
 app.get('/rtc/:channel/:role/:tokentype/:uid', nocache , generateRTCToken);
 app.get('/rtm/:uid/', nocache , generateRTMToken);
 app.get('/rte/:channel/:role/:tokentype/:uid', nocache , generateRTEToken);
+app.post('/send-notification', cors(), sendNotification);
 
 app.listen(PORT, () => {
   console.log(`Listening on port: ${PORT}`);
